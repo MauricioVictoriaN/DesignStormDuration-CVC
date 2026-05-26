@@ -1,0 +1,567 @@
+================================================================================
+MANUAL TÉCNICO
+analisis_precipitacion_horaria.R  -  v1.0.0
+================================================================================
+
+Design storm duration from hourly rainfall records
+in a bimodal Andean climate
+
+Autor: Mauricio Javier Victoria Nino
+Afiliacion: Investigador independiente - Cali, Colombia
+Contacto: hidratecsa@gmail.com  |  ORCID: 0009-0003-4328-5691
+Manuscrito: Victoria Nino, M.J. (2026). Design storm duration from hourly
+   rainfall records in a bimodal Andean climate (Version 2). Preprint, engrXiv.
+   DOI: https://doi.org/10.31224/7062
+Repositorio: https://github.com/MauricioVictoriaN/DesignStormDuration-CVC
+Licencia: MIT
+Version: 1.0.0  |  2026
+Reproducibilidad: set.seed(42) fijado en secciones Sec.9 y Sec.15
+
+
+================================================================================
+1. PROPOSITO Y MARCO METODOLOGICO
+================================================================================
+
+Este manual documenta el script analisis_precipitacion_horaria.R v1.0.0,
+implementacion computacional del marco metodologico publicado como preprint
+engrXiv (Version 2). El script automatiza el flujo completo de procesamiento
+de series de precipitacion horaria de la red hidrometeorologica CVC del Valle
+del Cauca, desde la lectura del archivo nativo hasta la obtencion de:
+
+- Duraciones de tormenta de diseno con intervalos de confianza al 95%
+- Coeficiente de avance (r) para cada tormenta independiente
+
+>> Marco metodologico. El objeto de la publicacion cientifica es el marco
+   metodologico, no el software. El script es el material suplementario de
+   reproducibilidad. Modifique unicamente la Seccion 1 (Configuracion) para
+   aplicar el marco a una nueva estacion.
+
+
+1.1 Flujo de procesamiento (17 secciones)
+
+--------------------------------------------------------------------
+Sec.  Seccion                 Proceso                    Salida principal
+--------------------------------------------------------------------
+0     Librerias               Instalacion y carga        --
+1     Configuracion           Parametros estacion        <- Unico bloque a editar
+2     Carga del archivo       Lectura robusta XLS/XLSX   df_raw
+3     Deteccion estructura    Localiza col. dia y 24h    col_dia, hora_cols
+4     Parseo bloques          Extrae bloques O(n)        df_parsed
+5     Control de calidad      Clasifica 4 categorias     df_serie, resumen_qc
+6     Relleno en cascada      Interp. lineal -> clim.    precip_relleno
+7     Depuracion OMM 168      Criterios C1-C2            tabla_dep, anios_ok
+8     Analisis exploratorio   Ciclos anual, mensual      stats, ciclo_m, ciclo_h
+9     Validacion cruzada      NSE, PBIAS, RMSE           metricas
+10    Modulo IETD             Restrepo-Posada 1982       df_torm, IETD_OPT
+10b   Coeficiente de avance r NUEVO r=(t_pico-t_ini)/D  r_median, r_stats
+11    Graficos G1-G15         PDF unico + PNG 150 dpi    Graficos_*.pdf, G*.png
+12    Excel general           9 hojas resultados         Resultados_*.xlsx
+13    Excel IETD              10 hojas: catalogo, r      IETD_*.xlsx
+14    Reporte consola         Resumen ejecutivo          --
+15    Frecuencia duraciones   KS + AD + bootstrap        G11-G14, hojas Excel
+--------------------------------------------------------------------
+
+
+================================================================================
+2. REQUISITOS DEL SISTEMA
+================================================================================
+
+2.1 Software
+
+  Componente       Version / Especificacion
+  ---------------- ----------------------------------------
+  R                >= 4.0 (recomendado 4.3)
+  RStudio          Opcional; cualquier version reciente
+  Memoria RAM      >= 4 GB (8 GB recomendado)
+  Espacio en disco >= 500 MB por estacion
+
+2.2 Paquetes R (instalacion automatica en Sec.0)
+
+  paquetes <- c("readxl","dplyr","tidyr","lubridate","ggplot2","writexl",
+                "zoo","scales","openxlsx","stringr","patchwork","gridExtra")
+
+2.3 Formato del archivo de entrada
+
+  Extension:      .xls o .xlsx (deteccion automatica)
+  Hoja requerida: VarHorarioTotal
+  Estructura:     Bloques mensuales con encabezado DIA\HORA + 24 cols hora
+  Valores faltantes: ***<, NA, celda vacia, Nulo
+
+  >> Compatibilidad Windows / Latin-1. El script normaliza la codificacion
+     mediante iconv(..., to='ASCII//TRANSLIT') para detectar el encabezado
+     DIA\HORA correctamente en cualquier locale Windows.
+
+
+================================================================================
+3. CONFIGURACION INICIAL - SECCION 1
+================================================================================
+
+La Seccion 1 es el unico bloque que debe modificarse al cambiar de estacion.
+
+3.1 Rutas
+
+  RUTA_ARCHIVO <- "D:\\R\\IETD\\Datos_precipitacion_crudos.xls"
+  RUTA_SALIDA  <- "D:\\R\\IETD\\"   # se crea automaticamente si no existe
+
+  >> Rutas en Windows. Use doble barra invertida \\ dentro de cadenas R.
+
+3.2 Metadatos de estacion
+
+  ESTACION     <- "La Primavera"
+  CODIGO       <- "NA"
+  MUNICIPIO    <- "Guadalajara de Buga"
+  DEPARTAMENTO <- "Valle del Cauca"
+  FUENTE       <- "CVC"
+  COORD_N      <- NA_real_
+  COORD_E      <- NA_real_
+  ALTURA_msnm  <- 1644
+
+3.3 Parametros hidrologicos
+
+  Parametro           Valor   Justificacion
+  ------------------- ------- --------------------------------------------
+  UMBRAL_LLUVIA       0.1     Traza minima detectable (balancin)
+  MAX_PRECIP          130     Limite fisico regional (IDEAM 2014)
+  MAX_GAP_RELLENO     6h      Maximo gap interpolable linealmente
+
+3.4 Parametros de depuracion OMM 168
+
+  Parametro           Valor   Norma           Justificacion
+  ------------------- ------- --------------- --------------------------------
+  UMBRAL_ANUAL        0.60    OMM 168 Sec.5.4 Ciclo variable CVC (8-16h)
+  UMBRAL_HUM          0.50    OMM 168 Sec.5.7 Temporada humeda (Mar-May/Sep-Nov)
+  APLICAR_C3          FALSE   OMM 168 Sec.5.7 Gaps estructurales del registrador
+  MESES_HUMEDA        3,4,5,9,10,11           Bimodal (Poveda et al. 2002)
+  ANIO_INICIO_UTIL    2014                    Primer ano con datos reales
+
+3.5 Parametros IETD
+
+  Parametro               Valor   Justificacion
+  ----------------------- ------- ------------------------------------------
+  IETD_CANDIDATOS         1-24h   Rango completo para evaluacion Cv=1
+  IETD_MAX_FISICO         6h      Cap fisico conveccion tropical andina
+  IETD_MIN_LLUVIA         0.1     = UMBRAL_LLUVIA
+  IETD_MIN_PROFUNDIDAD    1.0mm   Profundidad minima por tormenta
+
+
+================================================================================
+4. METODOLOGIA DETALLADA
+================================================================================
+
+4.1 Control de calidad (Sec.5)
+
+  Categoria    Criterio                           Accion
+  ----------- ----------------------------------- ----------------------------
+  Valido       0 <= P <= MAX_PRECIP               Se usa directamente
+  Faltante     NA, ***<, vacio, 'Nulo'            Se imputa en Sec.6
+  Negativo     P < 0                              Error instrumental -> NA
+  Extremo      P > MAX_PRECIP = 130 mm/h          Sobre limite fisico -> NA
+
+4.2 Relleno en cascada (Sec.6)
+
+  Stage 1 - Interpolacion lineal por tramos:
+    Para gaps de hasta MAX_GAP_RELLENO = 6h entre registros validos adyacentes.
+
+  Stage 2 - Climatologia horaria x mes (Paulhus & Kohler 1952):
+    Para gaps mas largos. Cada faltante en hora h del mes m se reemplaza por
+    la media historica de todos los registros validos de (h, m). 192 combinaciones.
+
+  Stage 3 - Cero residual:
+    Para gaps sin vecinos validos suficientes. Asume periodo seco.
+
+  >> Metricas de validacion cruzada (5% retiro aleatorio):
+     NSE = 0.005 (climatologia) vs -0.26 (interpolacion lineal)
+     PBIAS = 22.4% (climatologia) vs 22.9% (interpolacion)
+
+4.3 Depuracion hidrologica OMM 168 (Sec.7)
+
+  Criterio  Condicion                       Resultado       Norma
+  -------- -------------------------------- --------------- -----------------
+  C1        Disp. anual >= 60%              VALIDO_C1       OMM 168 Sec.5.4
+  C2        Disp. temp. humeda >= 50%       VALIDO_C2       OMM 168 Sec.5.7
+  C3        Gap > MAX_GAP_HUM en mes hum.   RECHAZADO       OMM 168 Sec.5.7
+  (activo)
+  Ninguno   No cumple C1 ni C2              RECHAZADO       OMM 168 Sec.5.4/7
+
+4.4 Modulo IETD - Restrepo-Posada & Eagleson (1982) (Sec.10)
+
+  Identificacion de tormentas:
+  Hora 'lluviosa' si P >= IETD_MIN_LLUVIA. Nuevo evento cuando periodo seco
+  acumulado >= IETD_h. Eventos con P < IETD_MIN_PROFUNDIDAD se descartan.
+
+  Criterio Cv = 1:
+  Si proceso Poisson estacionario, Cv_TBT = 1.
+
+  Cv < 1: IETD corto -> fragmenta sistemas multicelulares -> duracion subestimada
+  Cv > 1: IETD largo -> fusiona tormentas -> duracion sobreestimada
+
+  >> Proceso no-Poisson en el Valle del Cauca.
+     Para La Primavera, Cv_TBT = 4.47 con IETD = 6h. Propiedad estructural
+     del regimen bimodal. El analisis de frecuencia de duraciones es empirico
+     y agnostico al proceso de llegada.
+
+4.5 Coeficiente de avance (r) - NUEVO (Sec.10b)
+
+  Para cada tormenta independiente j, el coeficiente de avance r_j cuantifica
+  la posicion temporal del pico de intensidad:
+
+      r_j = (t_pico,j - t_inicio,j) / D_j
+
+  donde:
+    t_pico,j: timestamp de la maxima intensidad horaria dentro de la tormenta
+    t_inicio,j: inicio de la tormenta
+    D_j: duracion fisica = difftime(t_fin, t_inicio) + 1h
+
+  La duracion fisica D_j (envolvente temporal) es distinta de D_j^rain (horas
+  con lluvia >= 0.1 mm/h). Esta ultima se usa para frecuencia (Sec.15); la
+  primera se usa exclusivamente para r, garantizando r en [0,1].
+
+  Interpretacion fisica:
+    r ~ 0.00: pico al inicio (tormenta convectiva tipica)
+    r ~ 0.50: pico centrado (tormenta simetrica)
+    r ~ 1.00: pico al final (tormenta de cola cargada)
+
+  Estadisticos de r (caso La Primavera, n=1,027 tormentas, IETD=6h):
+
+  Estadistico     Valor
+  ------------------------
+  N tormentas     1,027
+  Mediana r       0.1667
+  Media r         0.2476
+  SD r            0.1953
+  Cv r            0.789
+  Asimetria Cs    0.941
+  P25 r           0.0909
+  P75 r           0.3750
+  Minimo r        0.0000
+  Maximo r        0.9375
+
+  r vs duracion real de tormenta:
+
+  Grupo duracion  N     Media r   Mediana r
+  ------------------------------------------
+  1-2h            201   0.188     0.091
+  3-4h            286   0.225     0.150
+  5-6h            195   0.246     0.200
+  7-8h            113   0.277     0.222
+  9-12h           109   0.290     0.250
+  13-24h           85   0.325     0.300
+  >24h             38   0.361     0.333
+
+  >> La mediana r = 0.167 indica que el pico ocurre tipicamente en el primer
+     17% de la duracion, consistente con el inicio abrupto de la precipitacion
+     convectiva tropical.
+
+4.6 Analisis de frecuencia de duraciones (Sec.15)
+
+  Enfoque poblacional vs. maximos anuales:
+  Opera sobre la poblacion completa (n=1,027), no sobre maximos anuales (n=9).
+  El cuantil D_p: "una tormenta seleccionada al azar tiene probabilidad P de
+  durar <= D_p horas".
+
+  Distribuciones ajustadas:
+
+  Distribucion  Parametros      Estimacion     Prediccion si Cv~1
+  ------------  --------------- -------------  ---------------------------
+  Exponencial   lambda=1/media  Momentos       Distribucion exacta Poisson
+  Gamma         k, theta        Momentos       k>1: sobre-dispersion
+  Log-Normal    mu_ln, sigma_ln Momentos ln(x) Cv>>1: cola pesada
+  Weibull       c, u            MLE            c>1: hazard creciente
+
+  Bondad de ajuste - tres criterios complementarios:
+
+  1. Kolmogorov-Smirnov (KS): sensible al centro. Con n>200, D_crit~1.36/raiz(n)
+     es muy pequeno. Usar la de menor D_KS.
+
+  2. Anderson-Darling (AD): pondera colas mas fuertemente. Criterio preferido
+     para cuantiles de alto Tr.
+
+  3. Coherencia IETD-distribucion: Cv~1 -> Exponencial; Cv>1 -> Gamma/Log-Normal.
+
+  Resultados La Primavera:
+
+  Distribucion  D_KS    A^2     Seleccion
+  ------------  ------  ------  -----------------
+  Exponencial   0.227   48.3
+  Gamma         0.159   18.7
+  Log-Normal    0.093   7.1     << Seleccionada
+  Weibull       0.123   12.9
+
+  Parametros Log-Normal: mu_ln = 1.352, sigma_ln = 0.743
+
+  Duraciones de diseno (Cunnane 1978: Tr <= 2*n_anos = 18a -> Tier I):
+
+  Tr (anos)  P    Duracion (h)  IC 95% (h)      r       Nivel
+  ---------------------------------------------------------------
+    2       0.50    3.86        [3.70, 4.05]    0.167   Tier I
+    5       0.80    7.22        [6.86, 7.63]    0.167   Tier I
+   10       0.90   10.01        [9.43, 10.68]   0.167   Tier I
+   25       0.96   13.97        [13.10, 14.92]  0.167   Tier II
+   50       0.98   17.76        [16.51, 19.24]  0.167   Tier II
+  100       0.99   21.74        [20.08, 23.70]  0.167   Tier II
+  200       0.995  26.17        [24.02, 28.70]  0.167   Tier II
+
+  >> El coeficiente de avance r = 0.167 es constante para todos los Tr porque
+     define la forma temporal del hietograma sintetico, no la magnitud.
+
+
+================================================================================
+5. NOVEDADES DE V1.0.0 RESPECTO A LA VERSION PRELIMINAR
+================================================================================
+
+  Componente                    Cambio
+  ----------------------------- ------------------------------------------------
+  Coeficiente de avance (r)     Nueva seccion Sec.10b en el script
+  Grafico G15                   Nueva figura: distribucion de r
+  Duracion fisica de tormenta   Nueva columna duracion_h_real
+  Archivo IETD_*.xlsx           Ampliado de 7 a 10 hojas:
+                                - Estadisticas r (nueva)
+                                - Percentiles r (nueva)
+                                - r vs Duracion (nueva)
+  15 graficos en PDF unico      G1-G15 en un solo PDF + 15 PNGs individuales
+  Guardado robusto de PNGs      Verificacion tryCatch + file.exists
+  Tabla de diseno               Nueva columna Coef_Avance_r
+  README.md                     Actualizado con r, G15, nuevas hojas Excel
+
+
+================================================================================
+6. EJECUCION Y DIAGNOSTICO
+================================================================================
+
+6.1 Ejecucion completa
+
+  1. Abrir RStudio y cargar analisis_precipitacion_horaria_v1.0.0.R
+  2. Modificar UNICAMENTE la Seccion 1 con los datos de la nueva estacion
+  3. Ejecutar: Ctrl+Shift+Enter (RStudio) o source('script.R')
+  4. Monitorear la consola - mensajes 'OK' confirman cada etapa
+  5. Archivos de salida en RUTA_SALIDA
+
+6.2 Mensajes de consola esperados (nuevos para r)
+
+  --- Estadisticos de r (v1.0.0) ---
+    N tormentas:    1027
+    Media r:        0.2476
+    Mediana r:      0.1667
+    SD r:           0.1953
+    Cv r:           0.789
+    Asimetria Cs r: 0.941
+    P25 r:          0.0909
+    P75 r:          0.3750
+    Rango r:        [0.0000, 0.9375]
+
+  >>> Coef. avance recomendado (mediana): r = 0.1667
+      Pico ocurre en el 16.7% de la duracion
+
+  --- r vs Duracion real ---
+    Duracion    N    r_media   r_mediana
+    1-2h       201  0.188     0.091
+    3-4h       286  0.225     0.150
+    ...
+
+6.3 Errores comunes y soluciones
+
+  Error/Mensaje                       Causa                          Solucion
+  ----------------------------------- ------------------------------ ----------------
+  Objeto 'df_dep' no encontrado       Se omiten datos de entrada     Ejecutar Sec.2-9
+  r fuera de [0,1] forzado a 0        Bug which.max con POSIXct      Actualizar a v1.0.0
+  PNGs no generados                   ggsave sin verificacion        Actualizar a v1.0.0
+  Cv=4.47 >> 1                        Regimen bimodal Valle Cauca    Comportamiento esperado
+
+
+================================================================================
+7. ARCHIVOS DE SALIDA
+================================================================================
+
+7.1 Resultados Excel
+
+  Archivo                         Hojas  Descripcion
+  ------------------------------- ------ --------------------------------------
+  Resultados_[estacion].xlsx      9      Metadatos, QC, Gaps, Estadisticas,
+                                         Anuales, Mensual, Diurno,
+                                         Validacion, OMM
+  IETD_[estacion].xlsx            10     Metadatos IETD, Cv, Catalogo con r,
+                                         TBT, Anuales, Serie, IDF,
+                                         Estadisticas r (nueva),
+                                         Percentiles r (nueva),
+                                         r vs Duracion (nueva)
+
+7.2 Graficos (15 totales)
+
+  Archivo                         Contenido
+  ------------------------------- ---------------------------------------------
+  G1_Serie_Anual.png              Precipitacion anual con tendencia lineal
+  G2_Ciclo_Mensual.png            Ciclo anual de precipitacion
+  G3_Ciclo_Diurno.png             Ciclo diurno
+  G4_Disponibilidad.png           Disponibilidad anual vs umbral C1
+  G5_Distribucion.png             Histograma log-log de intensidades
+  G6_Heatmap.png                  Mapa de calor precipitacion mensual
+  G7_Depuracion.png               Depuracion OMM 168
+  G8_IETD_Cv.png                  Curva Cv_TBT vs IETD
+  G9_Profundidades.png            Distribucion de profundidades
+  G10_TBT.png                     Distribucion de TBT
+  G11_Papel_Probabilidad.png      Papel de probabilidad
+  G12_Curva_Tr.png                Curva duracion-Tr
+  G13_Histograma_Densidad.png     Histograma + densidades
+  G14_QQplot.png                  QQ-plot
+  G15_Coef_Avance_r.png (NUEVO)   Distribucion del coeficiente de avance r
+
+  Todos incluidos en PDF unico: Graficos_Precipitacion_[estacion].pdf
+  PNGs individuales: 150 dpi, 12x6 pulgadas
+
+
+================================================================================
+8. ADAPTACION A OTRAS ESTACIONES CVC
+================================================================================
+
+8.1 Pasos para nueva estacion
+
+  1. Copiar archivo de datos a RUTA_ARCHIVO
+  2. Modificar SOLO Seccion 1
+  3. Ejecutar hasta Sec.7 y revisar disponibilidad
+  4. Si todos rechazados: reducir umbrales
+  5. Verificar IETD_OPT en consola
+  6. Ejecutar script completo y revisar Lista de Verificacion
+
+8.2 IETD_MAX_FISICO y r esperado por zona climatica
+
+  Zona / Regimen                    IETD_MAX_FISICO  r esperado (NUEVO)
+  --------------------------------- ---------------  --------------------
+  Valle del Cauca (bimodal, conv.)        6h           0.12 - 0.22
+  Pacifico colombiano (frontal)          12h           0.30 - 0.50
+  Cordillera (mixto)                      8h           0.20 - 0.35
+  Llanos Orientales (convectivo)          6h           0.10 - 0.20
+  Costa Caribe (seco-humedo)              8h           0.15 - 0.30
+
+8.3 UMBRAL_ANUAL por tipo de registrador
+
+  Tipo de registro                        UMBRAL_ANUAL
+  --------------------------------------- ------------
+  Registrador CVC ciclo variable (8-16h)  0.60 (60%) << caso estandar
+  Pluviografo analogico continuo          0.80 (80%) << norma OMM
+  Estacion automatica 24h                 0.80 (80%)
+  Registrador con gaps estacionales       Evaluar caso por caso
+
+8.4 Resultados esperados para estaciones CVC
+
+  Para estaciones CVC en Valle del Cauca con:
+  - n_anos en [8; 15]
+  - disponibilidad en [60; 70%]
+  - IETD_MAX_FISICO = 6h
+
+  Variable                      Rango esperado
+  ----------------------------- --------------------
+  Cv_TBT                        2 - 5 (no-Poisson)
+  N tormentas/ano               80 - 150
+  Duracion media de tormenta    3 - 7h
+  D_diseno Tr = 2 anos          2 - 6h
+  D_diseno Tr = 10 anos         8 - 12h
+  r mediana (NUEVO)             0.12 - 0.22
+
+
+================================================================================
+9. LIMITACIONES CONOCIDAS
+================================================================================
+
+  1. Longitud minima de serie: OMM 168 Sec.6.2 recomienda >= 10 anos.
+     Tier II (Tr > 18 anos) es indicativo.
+
+  2. Resolucion temporal horaria: no detecta tormentas < 60 min. Para
+     drenaje urbano en cuencas < 5 km2 se requiere pluviografia 5-15 min.
+
+  3. Proceso no-Poisson: Cv_TBT >> 1 en climas bimodales. Valido para
+     frecuencia de duraciones, no para tasas Poisson.
+
+  4. Imputacion por cero: en anos con >40% relleno, totales anuales
+     pueden estar subestimados.
+
+  5. Efectos de frontera inter-anual: tormentas entre ano valido y
+     excluido pueden truncarse.
+
+  6. Resolution horaria de r (NUEVO): el coeficiente de avance reportado
+     (r = 0.167) se basa en resolucion horaria. A resolucion sub-horaria
+     (5-15 min), el pico verdadero puede ser mas temprano y r mas pequeno.
+     El valor horario es un limite superior conservador.
+
+
+================================================================================
+10. REFERENCIAS
+================================================================================
+
+  Chow, V.T., Maidment, D.R. & Mays, L.W. (1988). Applied Hydrology.
+     McGraw-Hill.
+
+  Cunnane, C. (1978). Unbiased plotting positions. Journal of Hydrology,
+     37(3-4), 205-222.
+
+  Efron, B. & Tibshirani, R.J. (1993). An Introduction to the Bootstrap.
+     Chapman & Hall.
+
+  IDEAM (2014). Protocolo para el procesamiento y analisis de informacion
+     hidrometeorologica. Bogota.
+
+  Justus, C.G. et al. (1978). Methods for estimating wind speed frequency
+     distributions. J. Applied Meteorology, 17(3), 350-353.
+
+  Moriasi, D.N. et al. (2007). Model evaluation guidelines. Trans. ASABE,
+     50(3), 885-900.
+
+  OMM (2008). Guia de Practicas Hidrologicas. Vol. I, WMO-No. 168, 6a ed.
+
+  Paulhus, J.L.H. & Kohler, M.A. (1952). Interpolation of missing
+     precipitation records. Monthly Weather Review, 80(8), 129-133.
+
+  Poveda, G. et al. (2002). Seasonality in ENSO-related precipitation in
+     Colombia. Water Resources Research, 37(8).
+
+  Restrepo-Posada, P.J. & Eagleson, P.S. (1982). Identification of
+     independent rainstorms. Journal of Hydrology, 55(1-4), 303-319.
+
+  Rodriguez-Iturbe, I., Cox, D.R. & Isham, V. (1987). Some models for
+     rainfall based on stochastic point processes. Proc. R. Soc. London A,
+     410, 269-288.
+
+  Victoria Nino, M.J. (2026). Design storm duration from hourly rainfall
+     records in a bimodal Andean climate (Version 2). engrXiv.
+     DOI: 10.31224/7062
+
+
+================================================================================
+APENDICE - LISTA DE VERIFICACION DE EJECUCION
+================================================================================
+
+Antes de ejecutar
+-----------------
+[ ] Archivo de datos en la ruta especificada en RUTA_ARCHIVO
+[ ] Carpeta RUTA_SALIDA con permisos de escritura
+[ ] R >= 4.0 instalado con acceso a internet
+[ ] Seccion 1 actualizada con metadatos y parametros
+
+Verificar en consola tras ejecutar
+----------------------------------
+[ ] 'OK Archivo leido: N filas x 43 columnas'
+[ ] 'OK 24 columnas de hora detectadas'
+[ ] 'OK N bloques mensuales detectados' (> 100)
+[ ] 'Serie IETD: N anos [lista]' - verificar coherencia
+[ ] '>>> IETD OPTIMO': verificar que <= IETD_MAX_FISICO
+[ ] '>>> r mediana: ...' (NUEVO) - verificar rango 0.12-0.22
+[ ] Archivos .xlsx y .pdf generados en RUTA_SALIDA
+
+Revision de resultados
+----------------------
+[ ] G4 (Disponibilidad): anos coherentes con historial
+[ ] G8 (Cv vs IETD): curva descendente; punto optimo <= 6h
+[ ] G15 (r) (NUEVO): distribucion con mediana ~0.17, rango [0,1]
+[ ] G14 (QQ-plot): puntos alineados para duraciones 1-20h
+[ ] Duracion Tr = 2 anos: entre 2 y 6h
+[ ] N tormentas/ano: entre 80 y 150
+[ ] r mediana (NUEVO): entre 0.12 y 0.22
+
+Antes de reportar resultados Tier II (Tr >= 25 anos)
+-----------------------------------------------------
+[ ] n_anos_validos >= 10 (OMM 168 Sec.6.2); si no, indicativo
+[ ] Indicar explicitamente: 'Tier II - extrapolacion'
+[ ] Para Tr >= 50 anos: complementar con analisis regional
+
+================================================================================
+FIN DEL MANUAL TECNICO v1.0.0
+================================================================================
